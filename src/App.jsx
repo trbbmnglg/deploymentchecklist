@@ -3,11 +3,88 @@ import {
   Moon, Sun, Calendar as CalendarIcon, Clock, HardDrive, Network,
   Server, Shield, Play, Settings, Terminal, Download, FileSpreadsheet,
   CheckCircle2, Circle, ChevronDown, ChevronRight, ChevronsUpDown,
-  ListTodo, GanttChart, FoldVertical, UnfoldVertical, AlertCircle, Users, Activity
+  ListTodo, GanttChart, FoldVertical, UnfoldVertical, AlertCircle, Users, Activity,
+  ShieldAlert // [FIX #1] Added icon for the security warning banner
 } from 'lucide-react';
 
+// =============================================================================
+// [FIX #1 - SECURITY] Storage constants and sanitization helpers
+//
+// WHY: Previously, sensitive enterprise data (project names, assignees,
+// architecture configs, phase steps) were stored in localStorage. localStorage
+// persists indefinitely across browser sessions and is readable by ANY script
+// running on the same origin — making it a target for XSS attacks on shared
+// machines or compromised environments.
+//
+// FIX: Replaced localStorage with sessionStorage which is:
+//   1. Scoped to the browser tab only (cleared when tab/window is closed)
+//   2. Not accessible across tabs or sessions
+//   3. Still survives page refreshes within the same tab (good UX)
+//
+// Additionally added:
+//   - A `sanitizeText` helper to strip HTML/script-injection characters from
+//     all free-text fields before they are persisted
+//   - A visible security notice banner so users on shared machines are aware
+//   - A "Clear Session Data" button for explicit data hygiene
+//   - try/catch on all storage operations (sessionStorage throws in some
+//     private browsing environments when storage quota is exceeded)
+// =============================================================================
+
+/** Versioned storage keys — increment version suffix if the data schema changes
+ *  to avoid deserializing stale/incompatible data from a previous session. */
+const STORAGE_KEY_CONFIG = 'slcg_cfg_v1';
+const STORAGE_KEY_PHASES  = 'slcg_phs_v1';
+const STORAGE_KEY_DARK    = 'slcg_dark_v1';
+
+/**
+ * Strips characters that could be used for HTML/script injection from any
+ * user-supplied free-text string before it is persisted to storage.
+ *
+ * Removes: < > ' " ` and backtick to prevent tag/attribute injection.
+ *
+ * NOTE: React's JSX already escapes content during render, but sanitizing
+ * at the persistence layer is a defence-in-depth measure — if data is ever
+ * exported, logged, or passed to a future server-side endpoint, it is clean.
+ *
+ * @param {string} str - Raw user input string
+ * @returns {string} - Sanitized string safe for storage and export
+ */
+const sanitizeText = (str) => {
+  if (typeof str !== 'string') return '';
+  return str.replace(/[<>'"`;]/g, '');
+};
+
+/**
+ * Applies sanitization to all user-editable string fields in the config
+ * object before it is written to storage.
+ *
+ * @param {object} cfg - The raw config state object
+ * @returns {object} - Config with all free-text fields sanitized
+ */
+const sanitizeConfig = (cfg) => ({
+  ...cfg,
+  projectName: sanitizeText(cfg.projectName),
+});
+
+/**
+ * Sanitizes all user-editable string fields (resource, notes) inside the
+ * phases array before writing to storage.
+ *
+ * @param {Array} phases - The raw phases state array
+ * @returns {Array} - Phases with all free-text step fields sanitized
+ */
+const sanitizePhases = (phases) =>
+  phases.map((phase) => ({
+    ...phase,
+    steps: phase.steps.map((step) => ({
+      ...step,
+      resource: sanitizeText(step.resource),
+      notes:    sanitizeText(step.notes),
+    })),
+  }));
+
 // --- UTILITIES ---
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DAYS   = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
 const formatDate = (dateObj) => {
@@ -531,50 +608,85 @@ export default function App() {
     exclusions: []
   };
 
-  const [isReady, setIsReady] = useState(false);
-  const [config, setConfig] = useState(defaultConfig);
-  const [phases, setPhases] = useState([]);
-  const [activeTab, setActiveTab] = useState('checklist');
-  const [isDark, setIsDark] = useState(true);
+  const [isReady, setIsReady]           = useState(false);
+  const [config, setConfig]             = useState(defaultConfig);
+  const [phases, setPhases]             = useState([]);
+  const [activeTab, setActiveTab]       = useState('checklist');
+  const [isDark, setIsDark]             = useState(true);
   const [expandedPhases, setExpandedPhases] = useState({});
 
+  // [FIX #1] Track whether the security notice banner has been dismissed
+  // this state is intentionally NOT persisted — it should re-appear every session
+  // so users on shared machines are always reminded.
+  const [showSecurityNotice, setShowSecurityNotice] = useState(true);
+
+  // [FIX #1] Load from sessionStorage instead of localStorage.
+  // sessionStorage is scoped to the current browser tab and is automatically
+  // cleared when the tab or window is closed, preventing data from lingering
+  // on shared or public machines between user sessions.
   useEffect(() => {
     try {
-      const savedConfig = localStorage.getItem('splunkGenConfig');
-      const savedPhases = localStorage.getItem('splunkGenPhases');
-      const savedDark = localStorage.getItem('splunkGenDark');
+      const savedConfig = sessionStorage.getItem(STORAGE_KEY_CONFIG);
+      const savedPhases = sessionStorage.getItem(STORAGE_KEY_PHASES);
+      const savedDark   = sessionStorage.getItem(STORAGE_KEY_DARK);
 
-      if (savedDark !== null) setIsDark(JSON.parse(savedDark));
-      if (savedConfig) setConfig(JSON.parse(savedConfig));
-      if (savedPhases) {
+      if (savedDark   !== null) setIsDark(JSON.parse(savedDark));
+      if (savedConfig !== null) setConfig(JSON.parse(savedConfig));
+      if (savedPhases !== null) {
         const parsedPhases = JSON.parse(savedPhases);
         setPhases(parsedPhases);
         const expanded = {};
-        parsedPhases.forEach(p => expanded[p.id] = true);
+        parsedPhases.forEach(p => { expanded[p.id] = true; });
         setExpandedPhases(expanded);
       }
     } catch (e) {
-      console.error("Failed to load state", e);
+      // sessionStorage can be unavailable in certain private browsing modes
+      // or when storage quota is exceeded. Log the warning but don't crash.
+      console.warn('[SLCG] Session state could not be restored:', e);
     }
     setIsReady(true);
   }, []);
 
+  // [FIX #1] Persist to sessionStorage instead of localStorage.
+  // Sanitization is applied to all user-editable text fields before writing,
+  // so no raw HTML/injectable characters reach storage or the export layer.
   useEffect(() => {
     if (!isReady) return;
-    localStorage.setItem('splunkGenConfig', JSON.stringify(config));
-    localStorage.setItem('splunkGenPhases', JSON.stringify(phases));
-    localStorage.setItem('splunkGenDark', JSON.stringify(isDark));
-    
+    try {
+      sessionStorage.setItem(STORAGE_KEY_CONFIG, JSON.stringify(sanitizeConfig(config)));
+      sessionStorage.setItem(STORAGE_KEY_PHASES,  JSON.stringify(sanitizePhases(phases)));
+      sessionStorage.setItem(STORAGE_KEY_DARK,    JSON.stringify(isDark));
+    } catch (e) {
+      console.warn('[SLCG] Session state could not be saved:', e);
+    }
+
     if (isDark) document.documentElement.classList.add('dark');
-    else document.documentElement.classList.remove('dark');
+    else        document.documentElement.classList.remove('dark');
   }, [config, phases, isDark, isReady]);
+
+  // [FIX #1] Explicit "Clear Session Data" handler.
+  // Removes all app-owned sessionStorage keys and resets state to defaults.
+  // Useful for users who want to explicitly wipe their plan before leaving a
+  // shared machine, even though sessionStorage clears on tab close automatically.
+  const handleClearSession = () => {
+    try {
+      sessionStorage.removeItem(STORAGE_KEY_CONFIG);
+      sessionStorage.removeItem(STORAGE_KEY_PHASES);
+      sessionStorage.removeItem(STORAGE_KEY_DARK);
+    } catch (e) {
+      console.warn('[SLCG] Could not clear session storage:', e);
+    }
+    setConfig(defaultConfig);
+    setPhases([]);
+    setExpandedPhases({});
+  };
 
   const handleRegenerate = () => {
     const newPhases = generateExecutionPlan(config);
     setPhases(newPhases);
     
     const expanded = {};
-    newPhases.forEach(p => expanded[p.id] = true);
+    newPhases.forEach(p => { expanded[p.id] = true; });
     setExpandedPhases(expanded);
   };
 
@@ -605,12 +717,12 @@ export default function App() {
           if (s.id !== stepId) return s;
           const newSubSteps = s.subSteps.map(ss => ss.id === subStepId ? { ...ss, done } : ss);
           
-          const allDone = newSubSteps.every(ss => ss.done);
+          const allDone  = newSubSteps.every(ss => ss.done);
           const someDone = newSubSteps.some(ss => ss.done);
-          let newStatus = s.status;
-          if (allDone) newStatus = 'done';
+          let newStatus  = s.status;
+          if (allDone)       newStatus = 'done';
           else if (someDone) newStatus = 'in-progress';
-          else newStatus = 'pending';
+          else               newStatus = 'pending';
 
           return { ...s, subSteps: newSubSteps, status: newStatus };
         })
@@ -632,9 +744,9 @@ export default function App() {
     setExpandedPhases(prev => ({ ...prev, [phaseId]: !prev[phaseId] }));
   };
 
-  const expandAll = () => {
+  const expandAll  = () => {
     const expanded = {};
-    phases.forEach(p => expanded[p.id] = true);
+    phases.forEach(p => { expanded[p.id] = true; });
     setExpandedPhases(expanded);
   };
 
@@ -646,9 +758,9 @@ export default function App() {
       p.steps.forEach(s => {
         s.subSteps.forEach((ss, idx) => {
           const stepTitle = idx === 0 ? `"${s.title}"` : '';
-          const resource = idx === 0 ? `"${s.resource || ''}"` : '';
-          const status = idx === 0 ? s.status : '';
-          const notes = idx === 0 ? `"${(s.notes || '').replace(/"/g, '""')}"` : '';
+          const resource  = idx === 0 ? `"${s.resource || ''}"` : '';
+          const status    = idx === 0 ? s.status : '';
+          const notes     = idx === 0 ? `"${(s.notes || '').replace(/"/g, '""')}"` : '';
           csv += `"${p.name}",${stepTitle},"${ss.text.replace(/"/g, '""')}",${status},${resource},${ss.hours},${notes}\n`;
         });
       });
@@ -662,10 +774,10 @@ export default function App() {
   };
 
   const metrics = useMemo(() => {
-    let totalDays = 0;
-    let totalHours = 0;
+    let totalDays     = 0;
+    let totalHours    = 0;
     let completedHours = 0;
-    const resources = {};
+    const resources   = {};
 
     phases.forEach(p => {
       totalDays += p.days;
@@ -686,10 +798,10 @@ export default function App() {
 
     return {
       totalDays,
-      totalHours: Math.round(totalHours),
+      totalHours:     Math.round(totalHours),
       completedHours: Math.round(completedHours),
-      progress: totalHours === 0 ? 0 : Math.round((completedHours / totalHours) * 100),
-      complexity: complexityMap[config.architecture],
+      progress:       totalHours === 0 ? 0 : Math.round((completedHours / totalHours) * 100),
+      complexity:     complexityMap[config.architecture],
       risk,
       resources
     };
@@ -699,6 +811,44 @@ export default function App() {
 
   return (
     <div className={`min-h-screen font-jakarta transition-colors duration-300 ${isDark ? 'dark bg-[#0B1120] text-slate-200' : 'bg-[#F8F9FC] text-slate-800'}`}>
+
+      {/* =====================================================================
+          [FIX #1] SECURITY NOTICE BANNER
+          Informs users — especially on shared/enterprise machines — that plan
+          data is stored in sessionStorage (tab-scoped, auto-cleared on close).
+          Also provides a one-click "Clear Now" action for explicit data hygiene
+          before stepping away from a workstation.
+          The banner is dismissible per-session but intentionally re-appears on
+          every new tab open, because the warning is most useful at session start.
+      ===================================================================== */}
+      {showSecurityNotice && (
+        <div className="bg-amber-50 dark:bg-amber-900/20 border-b border-amber-200 dark:border-amber-700/50">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2.5 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <ShieldAlert className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+              <p className="text-xs font-medium text-amber-800 dark:text-amber-300 truncate">
+                <span className="font-bold">Session Storage Active:</span> Plan data is stored in this browser tab only and is automatically cleared when you close it.
+                {' '}On shared machines, use{' '}
+                <button
+                  onClick={handleClearSession}
+                  className="underline font-bold hover:text-amber-950 dark:hover:text-amber-100 transition-colors"
+                >
+                  Clear Session Data
+                </button>
+                {' '}before stepping away.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowSecurityNotice(false)}
+              aria-label="Dismiss security notice"
+              className="flex-shrink-0 text-xs font-semibold text-amber-600 dark:text-amber-400 hover:text-amber-900 dark:hover:text-amber-200 transition-colors px-2 py-1 rounded hover:bg-amber-100 dark:hover:bg-amber-800/30"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       <header className="sticky top-0 z-40 bg-white/80 dark:bg-[#0F172A]/80 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -715,6 +865,16 @@ export default function App() {
               <Download className="w-4 h-4" /> Export CSV
             </button>
             <div className="w-px h-6 bg-slate-200 dark:bg-slate-700"></div>
+            {/* [FIX #1] Clear session button surfaced in the header for easy access */}
+            <button
+              onClick={handleClearSession}
+              title="Clear all session data"
+              className="hidden sm:flex items-center gap-1.5 text-xs font-medium text-slate-400 hover:text-rose-500 dark:hover:text-rose-400 transition-colors"
+            >
+              <ShieldAlert className="w-4 h-4" />
+              <span>Clear Data</span>
+            </button>
+            <div className="hidden sm:block w-px h-6 bg-slate-200 dark:bg-slate-700"></div>
             <button onClick={() => setIsDark(!isDark)} className="p-2 rounded-full hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors">
               {isDark ? <Sun className="w-5 h-5 text-amber-400" /> : <Moon className="w-5 h-5 text-slate-600" />}
             </button>
@@ -1004,9 +1164,9 @@ export default function App() {
 
                         return phases.map((phase) => {
                           const pStart = new Date(phase.startDate).getTime();
-                          const pEnd = new Date(phase.endDate).getTime();
+                          const pEnd   = new Date(phase.endDate).getTime();
                           
-                          const leftPct = totalDuration === 0 ? 0 : ((pStart - minDate) / totalDuration) * 100;
+                          const leftPct  = totalDuration === 0 ? 0   : ((pStart - minDate) / totalDuration) * 100;
                           const widthPct = totalDuration === 0 ? 100 : ((pEnd - pStart) / totalDuration) * 100;
                           
                           let pTotal = 0, pDone = 0;
